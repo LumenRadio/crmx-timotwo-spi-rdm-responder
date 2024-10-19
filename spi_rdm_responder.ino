@@ -1,3 +1,10 @@
+/**
+ * This example provides a very simple RDM responder using the TimoTwo module's SPI interface.
+ * 
+ * This example does not implements any exhaustive error checking. This must be 
+ * added in a real-world implementation.
+ */
+
 #include <SPI.h>
 #include "timo_spi.h"
 #include "e120.h"
@@ -8,25 +15,36 @@
 
 #define TIMO_SPI_DEVICE_BUSY_IRQ_MASK (1 << 7)
 
-static timo_t timo = { .csn_pin =  7, .irq_pin = 6 };
+static timo_t timo = { .csn_pin =  5, .irq_pin = 3 };
 
+/* SPI communication buffers, make sure these are aligned to 32 bit words */
 static uint32_t tx_buffer32[256];
 static uint32_t rx_buffer32[256];
-
+/* point the working byte pointers to the aligned buffers */
 static uint8_t* tx_buffer = (uint8_t*)tx_buffer32;
 static uint8_t* rx_buffer = (uint8_t*)rx_buffer32;
+
 static bool has_set_up = false;
 
 static bool should_update_dmx_window = false;
 
-/* responder data */
+/* Responder data below */
+
+/* The UID to use for this responder, this should be changed in real-life applications */
 static Uid my_uid = {0x4c55, 0x11223344};
+
+/* DMX settings */
 static uint16_t dmx_start_addr = 0;
-static uint16_t dmx_footprint = 3;
+static uint16_t dmx_footprint = 512;
+
+/* Default device label */
 static uint8_t device_label_length = 4;
 static char device_label[32] = {'T', 'e', 's', 't'};
+
 static bool is_muted = false;
 static bool is_identifying = false;
+
+/* This list contains the RDM PIDs that the responder supports on top of the required ones from E1.20 standard */
 #define N_SUPPORTED_PIDS 			3
 const uint16_t supportedPidList[N_SUPPORTED_PIDS] = { DEVICE_MODEL_DESCRIPTION, MANUFACTURER_LABEL, DEVICE_LABEL };
 
@@ -42,11 +60,18 @@ bool irq_is_pending() {
   return pending;
 }
 
+/**
+ * This is the Arduino setup function, it's called when the Arduino starts up 
+ */
 void setup() {
-  Serial.begin(115200);
 
+  /* Initiate serial port to 250 kbps */
+  Serial.begin(250000);
+
+  /* Initiate SPI */
   SPI.begin();
 
+  /* Setup IRQ and CS pins */
   pinMode(timo.irq_pin, INPUT);
   pinMode(timo.csn_pin, OUTPUT);
   digitalWrite(timo.csn_pin, HIGH);
@@ -57,6 +82,7 @@ void setup() {
 
   delay(1000);
 
+  /* Clear the Serial port from any garbage bytes */
   while(Serial.available() > 0) {
     Serial.read();
   }
@@ -64,11 +90,15 @@ void setup() {
   Serial.println("Running");
   Serial.flush();
 
+  /* Wait here until module has booted and IRQ signal is high */
   while (irq_is_pending()) {
     ;
   }
 }
 
+/**
+ * This function updates the radio module's DMX_WINDOW function according to the DMX settings. 
+ */
 void update_dmx_window() {
     int16_t irq_flags;
     Serial.println("DMX window:");
@@ -78,12 +108,16 @@ void update_dmx_window() {
     tx_buffer[3] = dmx_start_addr;
     irq_flags = timo_transfer(TIMO_WRITE_REG_COMMAND(TIMO_DMX_WINDOW_REG), rx_buffer, tx_buffer, 5);
     irq_flags = timo_transfer(TIMO_READ_REG_COMMAND(TIMO_DMX_WINDOW_REG), rx_buffer, tx_buffer, 5);
-    print_response(irq_flags, rx_buffer, 1);
+    print_response(irq_flags, rx_buffer, 4);
 }
 
+/**
+ * This is the Arduino main loop function, it's called repeatedly 
+ */
 void loop() {
   int16_t irq_flags;
 
+  /* If we have not configured the radio module, do so now. */
   if (!has_set_up) {
 
     Serial.println("Version:");
@@ -103,11 +137,13 @@ void loop() {
       print_response(irq_flags, rx_buffer, 1);
     }
 
-    tx_buffer[0] = 0x89 | 0x04;
+    /* Enable SPI RDM */
+    tx_buffer[0] = 0x89;
     timo_transfer(TIMO_WRITE_REG_COMMAND(TIMO_CONFIG_REG), rx_buffer, tx_buffer, 2);
     irq_flags = timo_transfer(TIMO_READ_REG_COMMAND(TIMO_CONFIG_REG), rx_buffer, tx_buffer, 2);
     print_response(irq_flags, rx_buffer, 1);
 
+    /* Inform the radio module about our RDM UID. This is required. */
     Serial.println("Binding UID:");
     tx_buffer[0] = my_uid.mId >> 8;
     tx_buffer[1] = my_uid.mId;
@@ -122,14 +158,17 @@ void loop() {
     irq_flags = timo_transfer(TIMO_READ_REG_COMMAND(TIMO_STATUS_REG), rx_buffer, tx_buffer, 2);
     print_response(irq_flags, rx_buffer, 1);
 
+    /* Set default DMX_WINDOW settings */
     update_dmx_window();
 
+    /* We want IRQ when radio link status change, when DMX change, or extended interrupts */
     Serial.println("IRQ mask:");
     tx_buffer[0] = TIMO_IRQ_RF_LINK_FLAG | TIMO_IRQ_DMX_CHANGED_FLAG | TIMO_IRQ_EXTENDED_FLAG;
     irq_flags = timo_transfer(TIMO_WRITE_REG_COMMAND(TIMO_IRQ_MASK_REG), rx_buffer, tx_buffer, 2);
     irq_flags = timo_transfer(TIMO_READ_REG_COMMAND(TIMO_IRQ_MASK_REG), rx_buffer, tx_buffer, 2);
     print_response(irq_flags, rx_buffer, 1);
 
+    /* For extended interrupt we want IRW for RDM requests */
     Serial.println("Extended IRQ mask:");
     tx_buffer[0] = 0;
     tx_buffer[1] = 0;
@@ -143,50 +182,63 @@ void loop() {
 
   }
 
+  /* If DMX settings has changed, update the DMX_WINDOW settigs in the radio module */
   if (should_update_dmx_window) {
     update_dmx_window();
     should_update_dmx_window = false;
   }
 
+  /* if there is a pending IRQ */
   if (!digitalRead(timo.irq_pin)) {
+    /* Send NOP command to read the IRQ flags */
     irq_flags = timo_transfer(TIMO_NOP_COMMAND, rx_buffer, tx_buffer, 0);
 
+    /* Wait for IRQ signal to go high again - this indicates our command has been processed */
     while (!irq_is_pending()) {
       ;
     }
 
+    /* If the RF link status has changed, we read the status to clear the IRQ and print the status */
     if (irq_flags & TIMO_IRQ_RF_LINK_FLAG) {
       irq_flags = timo_transfer(TIMO_READ_REG_COMMAND(TIMO_STATUS_REG), rx_buffer, tx_buffer, 2);
       Serial.println("RF Link");
       print_response(irq_flags, rx_buffer, 1);
     }
 
+    /* If DMX has changed, we read the DMX data. This will also clear the IRQ. */
     if (irq_flags & TIMO_IRQ_DMX_CHANGED_FLAG) {
       irq_flags = timo_transfer(TIMO_READ_DMX_COMMAND, rx_buffer, tx_buffer, dmx_footprint+1);
       Serial.println("DMX data");
       print_response(irq_flags, rx_buffer, dmx_footprint);
     }
 
+    /* If there is a extended IRQ we need to check what to do */
     if (irq_flags & TIMO_IRQ_EXTENDED_FLAG) {
       uint32_t ext_flags;
       uint8_t response_length;
       bzero(tx_buffer, 5);
+      /* Read the extended IRQ flags */
       irq_flags = timo_transfer(TIMO_READ_REG_COMMAND(TIMO_EXT_IRQ_FLAGS_REG), rx_buffer, tx_buffer, 5);
       ext_flags = ((uint32_t)rx_buffer[0] << 24) | ((uint32_t)rx_buffer[1] << 16) | ((uint32_t)rx_buffer[2] << 8) | ((uint32_t)rx_buffer[3]);
+      
+      /* Check if we got an RDM request */
       if (ext_flags & TIMO_EXTIRQ_SPI_RDM_FLAG) {
         while (!irq_is_pending()) {
           ;
         }
+        /* Read the RDM request */
         bzero(tx_buffer, 255);
         timo_transfer_rdm_request(TIMO_READ_RDM_COMMAND, rx_buffer, tx_buffer, 255);
         Serial.println("RDM request");
         print_response(irq_flags, rx_buffer, rx_buffer[2]+2);
 
+        /* Process the RDM request and check if we have a response to return */
         response_length = parseRequest((RdmRequest*)rx_buffer);
 
+        /* If response length is > 0 it means we have a response to return */
         if (response_length > 0) {
-          if (rx_buffer[2] < 100) print_response(irq_flags, rx_buffer, rx_buffer[2]+2);
           delay(1);
+          /* Write the RDM response to the radio module */
           timo_transfer(TIMO_WRITE_RDM_COMMAND, tx_buffer, rx_buffer, response_length+1); // buffers swapped since response is in rx_buffer
           Serial.println("RDM response");
         }
@@ -196,18 +248,27 @@ void loop() {
 }
 
 /**
- * @param len   Length in bytes. IRQ flag is counted. Example: Use length 9 when reading the version register.
+ * Makes a complete SPI transaction with the TimoTwo module
+ *
+ * Return value:   The content of the IRQ flags register, or -1 if there was no response.
+ *
+ * @param command   The TimoTwo SPI command.
+ * @param *dst      Pointer to the buffer where to store the returned data
+ * @param *src      Pointer to the buffer containing data to transfer
+ * @param len       Length in bytes. IRQ flags is included. Example: Use length 9 when reading the version register.
  */
 int16_t timo_transfer(uint8_t command, uint8_t *dst, uint8_t *src, uint32_t len) {
   uint8_t irq_flags;
 
   uint32_t start_time = millis();
 
+  /* Perform the transfer of the command byte */
   digitalWrite(timo.csn_pin, LOW);
   irq_flags = SPI.transfer(command);
   irq_is_pending();
   digitalWrite(timo.csn_pin, HIGH);
 
+  /* If no bytes to transfer, this was a NOP command - just wait for IRQ or timeout */
   if (len == 0) {
     start_time = millis();
     while ((!digitalRead(timo.irq_pin)) && (!irq_is_pending())) {
@@ -218,26 +279,32 @@ int16_t timo_transfer(uint8_t command, uint8_t *dst, uint8_t *src, uint32_t len)
     return irq_flags;
   }
 
+  /* wait for IRQ or timeout */
   while(!irq_is_pending()) {
     if (millis() - start_time > 1000) {
       return -1;
     }
   }
 
+  /* start the payload transfer */
   digitalWrite(timo.csn_pin, LOW);
   irq_flags = SPI.transfer(0xff);
 
+  /* If busy flag is set we can't do the transfer now, cancel */
   if (irq_flags & TIMO_SPI_DEVICE_BUSY_IRQ_MASK) {
     digitalWrite(timo.csn_pin, HIGH);
     return irq_flags;
   }
 
+  /* Transfer the data */
   for (uint32_t i = 0; i < len - 1; i++) {
     *dst++ = SPI.transfer(*src++);
   }
 
+  /* End transfer */
   digitalWrite(timo.csn_pin, HIGH);
 
+  /* wait for IRQ or timeout */
   while (!digitalRead(timo.irq_pin)) {
     if (millis() - start_time > 50) {
       break;
@@ -246,16 +313,28 @@ int16_t timo_transfer(uint8_t command, uint8_t *dst, uint8_t *src, uint32_t len)
   return irq_flags;
 }
 
+/**
+ * Makes a complete SPI transaction that takes the RDM request length into consideration.
+ *
+ * Return value:   The content of the IRQ flags register, or -1 if there was no response.
+ *
+ * @param command   The TimoTwo SPI command.
+ * @param *dst      Pointer to the buffer where to store the returned data
+ * @param *src      Pointer to the buffer containing data to transfer
+ * @param max_len   Maximum length in bytes. The actual length is checked with the length field in RDM request.
+ */
 int16_t timo_transfer_rdm_request(uint8_t command, uint8_t *dst, uint8_t *src, uint32_t max_len) {
   uint8_t irq_flags;
 
   uint32_t start_time = millis();
 
+  /* Perform the transfer of the command byte */
   digitalWrite(timo.csn_pin, LOW);
   irq_flags = SPI.transfer(command);
   irq_is_pending();
   digitalWrite(timo.csn_pin, HIGH);
 
+  /* If no bytes to transfer, this was a NOP command - just wait for IRQ or timeout */
   if (max_len == 0) {
     start_time = millis();
     while ((!digitalRead(timo.irq_pin)) && (!irq_is_pending())) {
@@ -266,24 +345,29 @@ int16_t timo_transfer_rdm_request(uint8_t command, uint8_t *dst, uint8_t *src, u
     return 0;
   }
 
+  /* wait for IRQ or timeout */
   while(!irq_is_pending()) {
     if (millis() - start_time > 1000) {
       return -1;
     }
   }
 
+  /* start the payload transfer */
   digitalWrite(timo.csn_pin, LOW);
   irq_flags = SPI.transfer(0xff);
 
+  /* If busy flag is set we can't do the transfer now, cancel */
   if (irq_flags & TIMO_SPI_DEVICE_BUSY_IRQ_MASK) {
     digitalWrite(timo.csn_pin, HIGH);
     return 0;
   }
 
+  /* Transfer the data */
   for (uint32_t i = 0; i < max_len - 1; i++) {
     uint8_t data;
     data = SPI.transfer(*src++);
     if (i == 2) {
+      /* At this position in the RDM request the length (excluding checksum), use this as the correct length to read */
       if ((data + 2) < (max_len - 1)) {
         max_len = data + 2 + 1;
       }
@@ -291,8 +375,10 @@ int16_t timo_transfer_rdm_request(uint8_t command, uint8_t *dst, uint8_t *src, u
     *dst++ = data;
   }
 
+  /* End transfer */
   digitalWrite(timo.csn_pin, HIGH);
 
+  /* wait for IRQ or timeout */
   while (!digitalRead(timo.irq_pin)) {
     if (millis() - start_time > 50) {
       break;
@@ -301,6 +387,13 @@ int16_t timo_transfer_rdm_request(uint8_t command, uint8_t *dst, uint8_t *src, u
   return max_len - 1;
 }
 
+/**
+ * Converts a ASCII character as a single HEX digit to integer.
+ *
+ * Return value:   The value, 0-15.
+ *
+ * @param ascii    The hex character.
+ */
 uint8_t hex_nibble_to_val(char ascii) {
   if (ascii >= '0' && ascii <= '9') {
     return ascii - '0';
@@ -316,6 +409,13 @@ uint8_t hex_nibble_to_val(char ascii) {
   return 0;
 }
 
+/**
+ * Converts a an integer 0-15 to ASCII character as a single HEX digit.
+ *
+ * Return value:   The hex digit as ASCII char, '0'-'F'.
+ *
+ * @param nibble   The integer.
+ */
 char nibble_to_hex(uint8_t nibble) {
   nibble &= 0x0f;
   if (nibble >= 0 && nibble <= 9) {
@@ -325,6 +425,13 @@ char nibble_to_hex(uint8_t nibble) {
   }
 }
 
+/**
+ * Prints the response from the module as hex, including the IRQ flags.
+ *
+ * @param irq_flags  The IRQ flags
+ * @param *data      Pointer to the data
+ * @param len        Length of data
+ */
 void print_response(int16_t irq_flags, uint8_t *data, uint32_t len) {
   if (irq_flags < 0) {
     Serial.println("! Timeout");
@@ -343,6 +450,11 @@ void print_response(int16_t irq_flags, uint8_t *data, uint32_t len) {
   Serial.println();
 }
 
+/**
+ * Prints IRQ flags.
+ *
+ * @param irq_flags  The IRQ flags
+ */
 void print_irq_flags(int16_t irq_flags) {
   for (int i = 7; i >= 0; i--) {
     if (irq_flags & (1 << i)) {
@@ -355,17 +467,32 @@ void print_irq_flags(int16_t irq_flags) {
 }
 
 /*
- * RDM stuff below
+ * RDM functions below
  */
 
+/**
+ * Returns the manufacturer ID part of UID.
+ *
+ * @param uid  The RDM UID
+ */
 static uint16_t mId(uint8_t* uid) {
   return (uid[0] << 8) | uid[1];
 }
 
+/**
+ * Returns the device ID part of UID.
+ *
+ * @param uid  The RDM UID
+ */
 static uint32_t devId(uint8_t* uid) {
   return (uid[2] << 24) | (uid[3] << 16) | (uid[4] << 8) | uid[5];
 }
 
+/**
+ * Checks if destination is a broadcast (or vendorcast) address.
+ *
+ * @param destination  The RDM UID
+ */
 static bool isBroadcast(Uid* destination) {
   if (destination->devId == 0xFFFFFFFF) {
     return true;
@@ -374,6 +501,11 @@ static bool isBroadcast(Uid* destination) {
   }
 }
 
+/**
+ * Checks if destication is our UID.
+ *
+ * @param destination  The RDM UID
+ */
 static bool isToMe(Uid* destination) {
   if (destination->mId == my_uid.mId) {
  	  if ((destination->devId == my_uid.devId) || (destination->devId == 0xFFFFFFFF)) {
@@ -383,6 +515,11 @@ static bool isToMe(Uid* destination) {
   return false;
 }
 
+/**
+ * Calculate an RDM message's checksum.
+ *
+ * @param message  Pointer to RDM message
+ */
 static uint16_t calculateChecksum(RdmMessage* message) {
   uint16_t i, sum = 0;
 
@@ -392,6 +529,11 @@ static uint16_t calculateChecksum(RdmMessage* message) {
   return sum;
 }
 
+/**
+ * Returns an RDM message's checksum field.
+ *
+ * @param message  Pointer to RDM message
+ */
 static uint16_t extractChecksum(RdmMessage* message) {
   uint16_t pos;
 
@@ -399,6 +541,11 @@ static uint16_t extractChecksum(RdmMessage* message) {
   return (((uint8_t*)message)[pos] << 8) | ((uint8_t*)message)[pos+1];
 }
 
+/**
+ * Swap byte order between little endia and network byte order (big endian).
+ *
+ * @param message  Pointer to RDM message
+ */
 static void byteSwapAllElements(RdmMessage* message) {
  	uint8_t temp;
 
@@ -409,6 +556,11 @@ static void byteSwapAllElements(RdmMessage* message) {
  	message->subDevice = (message->subDevice >> 8) | (temp << 8);
 }
 
+/**
+ * Calculate an RDM message's checksum and set it in the checksum field.
+ *
+ * @param message  Pointer to RDM message
+ */
 static void setChecksum(RdmResponse* response) {
  	uint16_t i, sum = 0;
 
@@ -420,10 +572,21 @@ static void setChecksum(RdmResponse* response) {
  	((uint8_t*)response)[response->messageLength+1] = (uint8_t)sum;
 }
 
+/**
+ * Check if the checksum is correct in an RDM message.
+ *
+ * @param message  Pointer to RDM message
+ */
 static bool checksumIsOk(RdmMessage* message) {
   return extractChecksum(message) == calculateChecksum(message);
 }
 
+/**
+ * Check if our UID is within the search range.
+ *
+ * @param lower  The low end of the search range
+ * @param upper  The upper end of the search range
+ */
 static bool myUidIsWithinRange(Uid* lower, Uid* upper) {
  	if ((my_uid.mId >= lower->mId) && (my_uid.mId <= upper->mId)) {
  		if ((my_uid.mId > lower->mId) || (my_uid.devId >= lower->devId)) {
@@ -435,6 +598,11 @@ static bool myUidIsWithinRange(Uid* lower, Uid* upper) {
  	return false;
 }
 
+/**
+ * Helper function to update packet length and command class for a response.
+ *
+ * @param r  Pointer to the RDM response
+ */
 uint8_t prepareResponse(RdmResponse* r) {
   r->commandClass |= 0x01;
   byteSwapAllElements((RdmMessage*)r);
@@ -443,6 +611,13 @@ uint8_t prepareResponse(RdmResponse* r) {
   return r->messageLength + 2;
 }
 
+/**
+ * Helper function to create a NACK response.
+ *
+ * @param request     Pointer to the RDM request
+ * @param nackReason  The NACK reason from E1.20 standard
+ * 
+ */
 void nack(RdmRequest* request, uint16_t nackReason) {
 	RdmResponse* response;
 
@@ -454,15 +629,23 @@ void nack(RdmRequest* request, uint16_t nackReason) {
 	response->parameterData[1] = nackReason;
 }
 
+/**
+ * Process a MUTE or UNMUTE request.
+ *
+ * @param request     Pointer to the RDM request
+ * 
+ */
 static void discMuteOrUnMute(RdmRequest* request) {
 	RdmResponse* response;
 
+  /* NACK if command class is incorrect */
 	if (request->commandClass != DISCOVERY_COMMAND) {
     Serial.println("MUTE: NACK CC");
 		nack(request, NR_UNSUPPORTED_COMMAND_CLASS);
 		return;
 	}
 
+  /* NACK if message has wrong length */
 	if (request->parameterDataLength != 0) {
     Serial.println("MUTE: NACK FE");
 		nack(request, NR_FORMAT_ERROR);
@@ -472,13 +655,16 @@ static void discMuteOrUnMute(RdmRequest* request) {
 	response = (RdmResponse*)request;
 
 	if (request->parameterId == DISC_MUTE) {
+    /* mute */
 		is_muted = true;
     Serial.println("MUTE: MUTE");
 	} else {
+    /* unmute */
     Serial.println("MUTE: UNMUTE");
 		is_muted = false;
 	}
 
+  /* prepare response */
 	response->responseType = RESPONSE_TYPE_ACK;
 	response->parameterDataLength = 2;
 	response->parameterData[0] = 0;
@@ -486,17 +672,25 @@ static void discMuteOrUnMute(RdmRequest* request) {
   Serial.println("MUTE: RESP");
 }
 
+/**
+ * Process a IDENTIFY_DEVICE request.
+ *
+ * @param request     Pointer to the RDM request
+ * 
+ */
 static void identifyDevice(RdmRequest* request) {
 	RdmResponse* response;
 
 	response = (RdmResponse*)request;
 
+  /* NACK if command class is wrong */
 	if ((request->commandClass != SET_COMMAND) && (request->commandClass != GET_COMMAND)){
 		nack(request, NR_UNSUPPORTED_COMMAND_CLASS);
 		return;
 	}
 
 	if (request->commandClass == SET_COMMAND) {
+    /* set */
 		if (request->parameterDataLength != 1) {
 			nack(request, NR_FORMAT_ERROR);
 			return;
@@ -519,6 +713,7 @@ static void identifyDevice(RdmRequest* request) {
 		}
 		response->parameterDataLength = 0;
 	} else {
+    /* get */
 		response->parameterDataLength = 1;
 	}
 
@@ -526,9 +721,16 @@ static void identifyDevice(RdmRequest* request) {
 	response->parameterData[0] = is_identifying ? 1 : 0;
 }
 
+/**
+ * Process a DEVICE_INFO request.
+ *
+ * @param request     Pointer to the RDM request
+ * 
+ */
 static void deviceInfo(RdmRequest* request) {
 	RdmResponse* response;
 
+  /* Only GET is allowed */
 	if (request->commandClass != GET_COMMAND) {
 		nack(request, NR_UNSUPPORTED_COMMAND_CLASS);
 		return;
@@ -541,13 +743,13 @@ static void deviceInfo(RdmRequest* request) {
 	/* RDM version */
 	response->parameterData[0] = 0x01;
 	response->parameterData[1] = 0x00;
-	/* device model id */
+	/* device model id, this should be updated in a real world application */
 	response->parameterData[2] = 0xC0;
 	response->parameterData[3] = 0xDE;
 	/* product category */
 	response->parameterData[4] = PRODUCT_CATEGORY_FIXTURE >> 8;
 	response->parameterData[5] = PRODUCT_CATEGORY_FIXTURE & 0x00FF;
-	/* software version ID */
+	/* software version ID, this should be updated in a real world application  */
 	response->parameterData[6] = 1;
 	response->parameterData[7] = 0;
 	response->parameterData[8] = 0;
@@ -568,7 +770,12 @@ static void deviceInfo(RdmRequest* request) {
 	response->parameterData[18] = 0x00;
 }
 
-
+/**
+ * Process a DISCOVERY_UNIQUE_BRANCH request.
+ *
+ * @param request     Pointer to the RDM request
+ * 
+ */
 static uint8_t discUniqueBranch(RdmRequest* request) {
 	uint8_t* response;
 	Uid upper, lower;
@@ -582,6 +789,7 @@ static uint8_t discUniqueBranch(RdmRequest* request) {
 
 	response = (uint8_t*)request;
 
+  /* if out UID is within range and we are not already muted we should respond */
 	if ((myUidIsWithinRange(&lower, &upper)) && (!is_muted)) {
 		for (i=0; i<7; i++) {
 			response[i] = 0xFE;
@@ -609,11 +817,18 @@ static uint8_t discUniqueBranch(RdmRequest* request) {
   return 0;
 }
 
+/**
+ * Process a SOFTWARE_VERSION_LABEL request.
+ *
+ * @param request     Pointer to the RDM request
+ * 
+ */
 static void softwareVersionLabel(RdmRequest* request) {
 	RdmResponse* response;
 
 	response = (RdmResponse*)request;
 
+  /* only GET is allowed */
 	if (request->commandClass != GET_COMMAND) {
 		nack(request, NR_UNSUPPORTED_COMMAND_CLASS);
 		return;
@@ -624,9 +839,16 @@ static void softwareVersionLabel(RdmRequest* request) {
 	response->parameterDataLength = 6;
 }
 
+/**
+ * Process a DEVICE_MODEL_DESCRIPTION request.
+ *
+ * @param request     Pointer to the RDM request
+ * 
+ */
 static void deviceModelDescription(RdmRequest* request) {
 	RdmResponse* response;
 
+  /* only GET is allowed */
 	if (request->commandClass != GET_COMMAND) {
 		nack(request, NR_UNSUPPORTED_COMMAND_CLASS);
 		return;
@@ -639,9 +861,16 @@ static void deviceModelDescription(RdmRequest* request) {
 	memcpy(response->parameterData, "SPI RDM Test Responder", 22);
 }
 
+/**
+ * Process a MANUFACTURER_LABEL request.
+ *
+ * @param request     Pointer to the RDM request
+ * 
+ */
 static void manufacturerLabel(RdmRequest* request) {
 	RdmResponse* response;
 
+  /* only GET is allowed */
 	if (request->commandClass != GET_COMMAND) {
 		nack(request, NR_UNSUPPORTED_COMMAND_CLASS);
 		return;
@@ -654,10 +883,17 @@ static void manufacturerLabel(RdmRequest* request) {
   memcpy(response->parameterData, "LumenRadio", 10);
 }
 
+/**
+ * Process a SUPPORTED_PARAMETERS request.
+ *
+ * @param request     Pointer to the RDM request
+ * 
+ */
 static void supportedParameters(RdmRequest* request) {
   RdmResponse* response;
   uint8_t i;
 
+  /* only GET is allowed */
   if (request->commandClass != GET_COMMAND) {
     nack(request, NR_UNSUPPORTED_COMMAND_CLASS);
     return;
@@ -674,10 +910,17 @@ static void supportedParameters(RdmRequest* request) {
   response->parameterDataLength = 2*N_SUPPORTED_PIDS;
 }
 
+/**
+ * Process a DEVICE_LABEL request.
+ *
+ * @param request     Pointer to the RDM request
+ * 
+ */
 static void deviceLabel(RdmRequest* request) {
   RdmResponse* response;
 
   if (request->commandClass == GET_COMMAND) {
+    /* if it's a GET, return the current label */
     response = (RdmResponse*)request;
 
     response->responseType = RESPONSE_TYPE_ACK;
@@ -685,6 +928,7 @@ static void deviceLabel(RdmRequest* request) {
 
     memcpy(response->parameterData, device_label, device_label_length);
   } else if (request->commandClass == SET_COMMAND) {
+    /* if it's a SET, update the label */
     response = (RdmResponse*)request;
 
     device_label_length = MIN(response->parameterDataLength, 32);
@@ -694,17 +938,25 @@ static void deviceLabel(RdmRequest* request) {
     response->parameterDataLength = 0;
 
   } else {
+    /* no other command classes allowed */
     nack(request, NR_UNSUPPORTED_COMMAND_CLASS);
   }
 
   return;
 }
 
+/**
+ * Process a DMX_START_ADDRESS request.
+ *
+ * @param request     Pointer to the RDM request
+ * 
+ */
 static void dmxStartAddress(RdmRequest* request) {
   RdmResponse* response;
   uint16_t addr;
 
   if (request->commandClass == GET_COMMAND) {
+    /* return the current DMX address */
     response = (RdmResponse*)request;
 
     response->responseType = RESPONSE_TYPE_ACK;
@@ -714,6 +966,7 @@ static void dmxStartAddress(RdmRequest* request) {
     response->parameterData[0] = addr >> 8;
     response->parameterData[1] = addr;
   } else if (request->commandClass == SET_COMMAND) {
+    /* update the DMX address if it's a SET */
     if (request->parameterDataLength != 2) {
       nack(request, NR_FORMAT_ERROR);
     } else {
@@ -727,12 +980,19 @@ static void dmxStartAddress(RdmRequest* request) {
       response->parameterDataLength = 0;
     }
   } else {
+    /* No other command classes allowed */
     nack(request, NR_UNSUPPORTED_COMMAND_CLASS);
   }
 
   return;
 }
 
+/**
+ * Helper function that swaps destination and source addresses in a RDM message buffer.
+ *
+ * @param request     Pointer to the RDM message buffer
+ * 
+ */
 static void swapSrcDest(RdmMessage* m) {
   uint8_t temp[6];
 
@@ -741,18 +1001,27 @@ static void swapSrcDest(RdmMessage* m) {
   memcpy(m->sourceUid, temp, 6);
 }
 
+/**
+ * Process the RDM request.
+ *
+ * @param request     Pointer to the RDM message buffer
+ * 
+ */
 static uint8_t parseRequest(RdmRequest* request) {
   Uid destination;
   RdmResponse* response = (RdmResponse*)request;
 
+  /* check checksum */
   if (!checksumIsOk((RdmMessage*)request)) {
     Serial.println("RDM: invalid checksum");
+    /* don't continue oif checksum is invalid */
     return 0;
   }
 
   destination.mId = mId(request->destinationUid);
 	destination.devId = devId(request->destinationUid);
 
+  /* process it it's to us, or if it's broadcast, or vendorcast to our manufacturer ID */
   if (isToMe(&destination) || (isBroadcast(&destination) && ((destination.mId == 0xFFFF) || (destination.mId == my_uid.mId)))) {
     Serial.println("RDM: request is to me");
 
@@ -764,11 +1033,13 @@ static uint8_t parseRequest(RdmRequest* request) {
   		}
   	}
 
+    /* this responder do not have any subdevices - if it's addressed to a subdevice we need to NACK this */
   	if (request->subDevice != 0) {
       nack(request, NR_SUB_DEVICE_OUT_OF_RANGE);
   		return prepareResponse(response);
   	}
 
+    /* check what PID to process */
   	switch (request->parameterId) {
   		case DISC_UNIQUE_BRANCH:
         Serial.println("DISC_UNIQUE_BRANCH");
